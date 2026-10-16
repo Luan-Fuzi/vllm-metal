@@ -9,7 +9,7 @@ import torch
 from transformers import AutoTokenizer
 from vllm.tasks import PoolingTask
 
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
     encoder_model_path,
     load_encoder_weights,
