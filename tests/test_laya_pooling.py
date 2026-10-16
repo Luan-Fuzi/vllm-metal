@@ -11,10 +11,11 @@ from torch import nn
 from transformers import ModernBertConfig, ModernBertModel
 from vllm.pooling_params import PoolingParams
 
+from tests.test_v1_pooling import _new_req, _scheduler_output
 from vllm_metal.laya_registration import register
 from vllm_metal.v1.pooling.backends.encoder.models.laya import (
-    LayaModel,
-    LayaPooler,
+    LayaPoolingBackend,
+    _create_model,
     clamp_temperature,
     temperature_for,
 )
@@ -64,8 +65,9 @@ def models():
     reference.act_head = nn.Sequential(
         nn.Linear(132, 256), nn.GELU(), nn.Linear(256, 2)
     )
+    reference.register_buffer("temperature", torch.ones(3))
     reference.eval()
-    model = LayaModel(ec.to_dict(), ac)
+    model = _create_model(ec.to_dict(), ac)
     weights = model.sanitize(
         {k: mx.array(v.detach().numpy()) for k, v in reference.state_dict().items()}
     )
@@ -77,17 +79,32 @@ def models():
     )
     view = PoolingConfigView(
         SimpleNamespace(
-            hf_config=hf, pooler_config=pooler_config, multimodal_config=None
+            hf_config=hf,
+            pooler_config=pooler_config,
+            multimodal_config=None,
+            runner_type="pooling",
+            served_model_name="laya-test",
+            model="laya-test",
         )
     )
-    return model, reference, LayaPooler(view, model), ac
+    return model, reference, LayaPoolingBackend(view, model), ac
+
+
+def pool_request(backend, request):
+    scheduled = _new_req(
+        request.req_id, list(request.token_ids), pooling_params=request.pooling_params
+    )
+    outputs = backend.pool_scheduler_output(
+        _scheduler_output(new_reqs=[scheduled]), backend.config.model_config
+    )
+    return outputs[0].pooler_output
 
 
 @pytest.mark.parametrize(
     "qtype,count", [(0, 1), (0, 2), (0, 6), (0, 11), (1, 3), (2, 2)]
 )
 def test_torch_parity(qtype, count):
-    model, reference, pooler, ac = models()
+    model, reference, backend, ac = models()
     ids = torch.randint(20, 512, (1, 150))
     ids[0, 0], ids[0, 1] = 2, ac["qtype_token_ids"][qtype]
     marker_positions = torch.arange(5, 5 + count * 3, 3)
@@ -105,15 +122,13 @@ def test_torch_parity(qtype, count):
             [top[:, 0], top[:, 0] - top[:, 1], ent, (k / 255).expand(1)], -1
         )
         actions = reference.act_head(torch.cat([h[:, 0], features], -1))
-    mh = model(mx.array(ids.numpy()), mx.array(mask.numpy()))
-    np.testing.assert_allclose(np.array(mh), h.numpy(), atol=3e-5, rtol=3e-5)
     for activated in (False, True):
         req = EncoderPoolingRequest(
             "r",
             tuple(ids[0].tolist()),
             PoolingParams(task="token_classify", use_activation=activated),
         )
-        actual = pooler.pool_one(mh, req).numpy()
+        actual = pool_request(backend, req).numpy()
         expected_p = (
             (logits / temperature_for(ac, qtype, count)).softmax(-1)
             if activated
@@ -127,20 +142,51 @@ def test_torch_parity(qtype, count):
 
 
 def test_padding_and_profiling():
-    model, _, pooler, _ = models()
+    model, _, backend, _ = models()
     ids = mx.array([[2, 11, 7, 21, 7, 22]])
-    h = model(ids, mx.ones(ids.shape, dtype=mx.int32))
+    h = backend.forward_padded(ids, mx.ones(ids.shape, dtype=mx.int32))
     padded = mx.concatenate([ids, mx.zeros((1, 7), dtype=mx.int32)], -1)
     mask = mx.concatenate([mx.ones_like(ids), mx.zeros((1, 7), dtype=mx.int32)], -1)
-    hp = model(padded, mask)
+    hp = backend.forward_padded(padded, mask)
     np.testing.assert_allclose(np.array(h), np.array(hp[:, :6]), atol=2e-5, rtol=2e-5)
-    dummy = model(mx.zeros((1, 1), dtype=mx.int32), mx.ones((1, 1), dtype=mx.int32))
-    req = EncoderPoolingRequest("dummy", (0,), PoolingParams(task="token_classify"))
-    assert pooler.pool_one(dummy, req).shape == (0, 3)
+    for length in (1, 150):
+        dummy = backend.profile_forward(mx.zeros((1, length), dtype=mx.int32))
+        assert bool(mx.all(mx.isfinite(dummy)).item())
     with pytest.raises(NotImplementedError, match="dimensions"):
-        pooler.validate_params(PoolingParams(task="token_classify", dimensions=2))
+        backend.validate_params(PoolingParams(task="token_classify", dimensions=2))
     with pytest.raises(NotImplementedError, match="token_classify"):
-        pooler.validate_params(PoolingParams(task="embed"))
+        backend.validate_params(PoolingParams(task="embed"))
+
+
+def test_no_markers_returns_empty_without_model_forward(monkeypatch):
+    model, _, backend, _ = models()
+
+    def unexpected_forward(*args):
+        pytest.fail("A marker-free request must not run the decision model")
+
+    monkeypatch.setattr(type(model), "__call__", unexpected_forward)
+    req = EncoderPoolingRequest("empty", (0,), PoolingParams(task="token_classify"))
+    assert pool_request(backend, req).shape == (0, 3)
+
+
+def test_scheduler_preserves_laya_request_order_and_rejects_partial_prompts():
+    _, _, backend, _ = models()
+    params = PoolingParams(task="token_classify")
+    requests = [
+        _new_req("two", [2, 10, 7, 21, 7, 22], pooling_params=params),
+        _new_req("one", [2, 12, 7, 21], pooling_params=params),
+    ]
+    config = backend.config.model_config
+    result = backend.pool_scheduler_output(_scheduler_output(new_reqs=requests), config)
+    assert [out.req_id for out in result] == ["two", "one"]
+    assert [out.pooler_output.shape for out in result] == [(2, 3), (1, 3)]
+    with pytest.raises(NotImplementedError, match="full-prompt"):
+        backend.pool_scheduler_output(
+            _scheduler_output(
+                new_reqs=requests, num_scheduled_tokens={"two": 1, "one": 4}
+            ),
+            config,
+        )
 
 
 @pytest.mark.parametrize(
@@ -231,10 +277,16 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
             {"revision": "pinned-tokenizer-revision", "trust_remote_code": False},
         )
     ]
-    ids = mx.array([[2, 10, 7, 21, 7, 22]])
-    mask = mx.ones_like(ids)
+    request = EncoderPoolingRequest(
+        "loaded",
+        (2, 10, 7, 21, 7, 22),
+        PoolingParams(task="token_classify", use_activation=False),
+    )
+    expected_backend = LayaPoolingBackend(PoolingConfigView(config), model)
     np.testing.assert_allclose(
-        np.array(loaded.model(ids, mask)), np.array(model(ids, mask)), atol=1e-6
+        pool_request(loaded.pooling_backend, request).numpy(),
+        pool_request(expected_backend, request).numpy(),
+        atol=1e-6,
     )
     assert loaded.pooling_backend.supported_tasks() == ("token_classify",)
     assert not supports_encoder_pooling_backend(
@@ -253,6 +305,15 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
         ({"quantization": "awq"}, None, None, NotImplementedError, "quantization"),
         ({}, "quantization_config", {"bits": 4}, NotImplementedError, "quantization"),
         ({}, "laya_config", {"qtype_token_ids": [10, 10, 12]}, ValueError, "distinct"),
+        ({}, "hidden_activation", "relu", NotImplementedError, "GELU"),
+        ({}, "model_type", "bert", NotImplementedError, "ModernBERT"),
+        (
+            {},
+            "rope_parameters",
+            {"full_attention": {"rope_type": "linear"}},
+            NotImplementedError,
+            "RoPE",
+        ),
     ],
 )
 def test_loader_rejects_unsupported_before_io(
@@ -263,7 +324,8 @@ def test_loader_rejects_unsupported_before_io(
     _, reference, _, ac = models()
     config = checkpoint_config(reference, ac, tmp_path / "not-downloaded", **overrides)
     if config_field:
-        setattr(config.hf_config, config_field, value)
+        values = {**config.hf_config.to_dict(), config_field: value}
+        monkeypatch.setattr(config.hf_config, "to_dict", lambda: values)
 
     def unexpected_io(*args, **kwargs):
         pytest.fail("Rejected model must not download or load weights/tokenizer")
@@ -271,6 +333,21 @@ def test_loader_rejects_unsupported_before_io(
     monkeypatch.setattr(laya, "encoder_model_path", unexpected_io)
     monkeypatch.setattr(laya.AutoTokenizer, "from_pretrained", unexpected_io)
     with pytest.raises(error, match=message):
+        laya.load_laya_backend(config)
+
+
+@pytest.mark.parametrize("act_costs", [{}, {"escalate": 0.5, "delegate": 0.2}])
+def test_loader_rejects_other_action_counts_before_io(tmp_path, monkeypatch, act_costs):
+    from vllm_metal.v1.pooling.backends.encoder.models import laya
+
+    _, reference, _, ac = models()
+    config = checkpoint_config(reference, {**ac, "act_costs": act_costs}, tmp_path)
+
+    def unexpected_io(*args):
+        pytest.fail("Unsupported action heads must be rejected before loading weights")
+
+    monkeypatch.setattr(laya, "encoder_model_path", unexpected_io)
+    with pytest.raises(NotImplementedError, match="two action classes"):
         laya.load_laya_backend(config)
 
 
