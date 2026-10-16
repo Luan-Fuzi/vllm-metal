@@ -6,14 +6,19 @@ pooling backend. Real-checkpoint validation covers
 `e929ae5cf69bc34259cd2f95c9e91145b818b1f0`. Other Laya checkpoints, including
 the multilingual mmBERT variant, have not been validated on this backend.
 Each prompt describes one `choice`, `score`, or `noul` question.
+Model execution reuses mlx-vlm's Laya and ModernBERT definitions. The Metal
+adapter handles request metadata, calibration, and token-pooling outputs.
 The `token_classify` result has one row per `[MASK]` option marker:
 `[p_option, *p_action]`. Option probabilities use the checkpoint's temperature
 calibration. The action distribution is repeated on every row. Setting
 `use_activation: false` returns option and action logits instead.
 
 This initial implementation requires `float32`. Quantization, chunked requests,
-and output dimension truncation are unsupported. It uses full bidirectional
-encoder attention and does not allocate a decoder KV cache.
+and output dimension truncation are unsupported. The checkpoint must define
+one configured action in `act_costs`, giving two action logits including the
+default action. It uses full bidirectional encoder attention and does not
+allocate a decoder KV cache. The loader preserves the checkpoint's exact GELU
+activation; mlx-vlm 0.7.6 otherwise uses a tanh approximation in ModernBERT.
 
 ## Prepare and serve a checkpoint
 
