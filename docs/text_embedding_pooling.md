@@ -14,7 +14,7 @@ per request through the same `pooler_output` contract.
 Canonical unquantized `BAAI/bge-m3` is supported on the encoder pooling path
 for dense `embed` output and sparse `token_classify` lexical weights.
 
-ModernBERT-based Laya checkpoints support FP32 `token_classify` decision
+ModernBERT-based Laya checkpoints support `token_classify` decision
 outputs. See [Laya typed decisions](structured_decisions.md#laya) for native
 checkpoint loading and request examples.
 
@@ -39,7 +39,7 @@ Current scope is intentionally narrow:
   pooling and L2 normalization, including `intfloat/multilingual-e5-base`
 - BGE-M3 sparse lexical weights through `/pooling` with
   `pooler_config.task="token_classify"`
-- FP32 Laya option probabilities and action distributions through `/pooling`
+- Laya option probabilities and action distributions through `/pooling`
   with `task="token_classify"` and ALL token pooling
 
 ## Unsupported

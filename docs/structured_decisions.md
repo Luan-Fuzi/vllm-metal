@@ -34,8 +34,9 @@ DiffusionGemma currently accepts text input only and uses the MLX backend.
 ## Laya
 
 Validated checkpoint: `convaiinnovations/laya-typed-decisions`, revision
-`e929ae5cf69bc34259cd2f95c9e91145b818b1f0`. Support is text-only FP32
-ModernBERT with one configured action in `act_costs` (two action logits).
+`e929ae5cf69bc34259cd2f95c9e91145b818b1f0`. Support is text-only
+ModernBERT in FP32, FP16, or BF16, with one configured action in `act_costs`
+(two action logits).
 Other checkpoints, including multilingual variants, remain unvalidated.
 Quantization, chunked requests, and output dimension truncation are unsupported.
 
@@ -49,6 +50,12 @@ vllm serve convaiinnovations/laya-typed-decisions \
   --runner pooling --dtype float32 --max-model-len 1024 \
   --enforce-eager --no-enable-prefix-caching
 ```
+
+Use `--dtype float16` or `--dtype bfloat16` for reduced-precision weights and
+encoder activations. Logits and probability calculations retain upstream FP32
+handling. Reduced precision can change probabilities and close option rankings;
+use FP32 to reproduce the validated CPU FP32 reference. `--dtype auto` follows
+vLLM's dtype selection.
 
 An original local checkpoint directory can replace the Hub model ID. Keep its
 `encoder/config.json`, `rl_agent_config.json`, `tokenizer/`, and weights in

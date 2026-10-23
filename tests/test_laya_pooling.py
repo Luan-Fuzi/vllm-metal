@@ -7,6 +7,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from mlx.utils import tree_flatten
 from torch import nn
 from transformers import ModernBertConfig, ModernBertModel
 from vllm.pooling_params import PoolingParams
@@ -103,8 +104,20 @@ def pool_request(backend, request):
 @pytest.mark.parametrize(
     "qtype,count", [(0, 1), (0, 2), (0, 6), (0, 11), (1, 3), (2, 2)]
 )
-def test_torch_parity(qtype, count):
+@pytest.mark.parametrize(
+    "torch_dtype,mlx_dtype,atol",
+    [
+        (torch.float32, mx.float32, 2e-5),
+        (torch.float16, mx.float16, 1e-3),
+        (torch.bfloat16, mx.bfloat16, 1e-2),
+    ],
+)
+def test_torch_parity(qtype, count, torch_dtype, mlx_dtype, atol):
     model, reference, backend, ac = models()
+    model.set_dtype(mlx_dtype)
+    reference.to(torch_dtype)
+    # Upstream combines FP32 action features with the cast action-head weights.
+    reference.act_head.float()
     ids = torch.randint(20, 512, (1, 150))
     ids[0, 0], ids[0, 1] = 2, ac["qtype_token_ids"][qtype]
     marker_positions = torch.arange(5, 5 + count * 3, 3)
@@ -121,7 +134,8 @@ def test_torch_parity(qtype, count):
         features = torch.stack(
             [top[:, 0], top[:, 0] - top[:, 1], ent, (k / 255).expand(1)], -1
         )
-        actions = reference.act_head(torch.cat([h[:, 0], features], -1))
+        assert h.dtype == torch_dtype
+        actions = reference.act_head(torch.cat([h[:, 0].float(), features], -1))
     for activated in (False, True):
         req = EncoderPoolingRequest(
             "r",
@@ -138,7 +152,8 @@ def test_torch_parity(qtype, count):
         expected = torch.cat(
             [expected_p[:, :, None], expected_a[:, None, :].expand(1, count, 2)], -1
         )[0]
-        np.testing.assert_allclose(actual, expected.numpy(), atol=2e-5, rtol=3e-5)
+        assert actual.dtype == np.float32
+        np.testing.assert_allclose(actual, expected.numpy(), atol=atol, rtol=atol)
 
 
 def test_padding_and_profiling():
@@ -241,7 +256,17 @@ def checkpoint_config(reference, ac, path, **overrides):
     return SimpleNamespace(**values)
 
 
-def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "torch_dtype,mlx_dtype",
+    [
+        (torch.float32, mx.float32),
+        (torch.float16, mx.float16),
+        (torch.bfloat16, mx.bfloat16),
+    ],
+)
+def test_checkpoint_loads_through_factory(
+    tmp_path, monkeypatch, torch_dtype, mlx_dtype
+):
     from safetensors.torch import save_file
 
     from vllm_metal.v1.pooling.backends.encoder.factory import (
@@ -256,7 +281,7 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
     state = {k: v.half().contiguous() for k, v in reference.state_dict().items()}
     save_file(state, str(tmp_path / "model.safetensors"))
     expected = model.sanitize(
-        {k: mx.array(v.float().numpy()) for k, v in state.items()}
+        {k: mx.array(v.float().numpy()).astype(mlx_dtype) for k, v in state.items()}
     )
     model.load_weights(list(expected.items()), strict=True)
     calls = []
@@ -276,7 +301,7 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
         return tokenizer
 
     monkeypatch.setattr(laya, "cached_tokenizer_from_config", load_tokenizer)
-    config = checkpoint_config(reference, ac, tmp_path)
+    config = checkpoint_config(reference, ac, tmp_path, dtype=torch_dtype)
     config.hf_config.laya_config = {
         key: value
         for key, value in ac.items()
@@ -284,6 +309,12 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
     }
     assert supports_encoder_pooling_backend(config)
     loaded = load_encoder_pooling_backend(config)
+    assert {value.dtype for _, value in tree_flatten(loaded.model.parameters())} == {
+        mlx_dtype
+    }
+    ids = mx.array([[2, 10, 7, 21, 7, 22]], dtype=mx.int32)
+    hidden = loaded.pooling_backend.forward_padded(ids, mx.ones_like(ids))
+    assert hidden.dtype == mlx_dtype
     assert loaded.tokenizer is tokenizer
     assert calls == [config]
     assert loaded.model_args["laya_config"]["qtype_token_ids"] == [10, 11, 12]
@@ -339,8 +370,6 @@ def test_invalid_tokenizer_is_rejected_before_weights(
 @pytest.mark.parametrize(
     "overrides,config_field,value,error,message",
     [
-        ({"dtype": torch.float16}, None, None, NotImplementedError, "float32"),
-        ({"dtype": torch.bfloat16}, None, None, NotImplementedError, "float32"),
         ({"quantization": "awq"}, None, None, NotImplementedError, "quantization"),
         ({}, "quantization_config", {"bits": 4}, NotImplementedError, "quantization"),
         ({}, "hidden_activation", "relu", NotImplementedError, "GELU"),

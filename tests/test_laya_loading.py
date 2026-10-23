@@ -4,6 +4,7 @@
 import json
 
 import pytest
+import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
@@ -55,8 +56,17 @@ def source_checkpoint(tmp_path):
     return source
 
 
+@pytest.mark.parametrize(
+    "dtype,expected_dtype",
+    [
+        ("float32", torch.float32),
+        ("float16", torch.float16),
+        ("bfloat16", torch.bfloat16),
+        ("auto", torch.float16),
+    ],
+)
 def test_native_layout_works_through_vllm_frontend(
-    source_checkpoint, inspect_vllm_models_in_process
+    source_checkpoint, inspect_vllm_models_in_process, dtype, expected_dtype
 ):
     source = source_checkpoint
     before = {
@@ -70,12 +80,13 @@ def test_native_layout_works_through_vllm_frontend(
         config_format="laya",
         tokenizer_mode="laya",
         runner="pooling",
-        dtype="float32",
+        dtype=dtype,
         max_model_len=128,
         enforce_eager=True,
         enable_prefix_caching=False,
     ).create_engine_config()
     hf_config = config.model_config.hf_config
+    assert config.model_config.dtype == expected_dtype
     assert hf_config.hidden_size == 128
     assert hf_config.architectures == ["LayaForDecision"]
     assert hf_config.laya_config["temperature"] == [1, 2, 3]

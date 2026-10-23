@@ -22,7 +22,7 @@ from vllm.tokenizers.protocol import TokenizerLike
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.config_parser_base import ConfigParserBase
 
-from vllm_metal.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE, mlx_to_torch
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
     encoder_model_path,
     load_encoder_weights,
@@ -275,8 +275,7 @@ def load_laya_backend(model_config: Any) -> LoadedEncoderBackend:
     config = model_config.hf_config.to_dict()
     if model_config.quantization is not None or config.get("quantization_config"):
         raise NotImplementedError("Metal Laya does not support quantization yet.")
-    if model_config.dtype != torch.float32:
-        raise NotImplementedError("Metal Laya currently requires dtype=float32.")
+    target_dtype = TORCH_TO_MLX_DTYPE[model_config.dtype]
     agent_config = dict(config["laya_config"])
     model = _create_model(config, agent_config)
     tokenizer = cached_tokenizer_from_config(model_config)
@@ -293,10 +292,13 @@ def load_laya_backend(model_config: Any) -> LoadedEncoderBackend:
     )
     config["laya_config"] = agent_config
     weights = model.sanitize(load_encoder_weights(encoder_model_path(model_config)))
-    model.load_weights(
-        [(name, value.astype(mx.float32)) for name, value in weights.items()],
-        strict=True,
-    )
+    weights = {
+        name: value.astype(target_dtype)
+        if mx.issubdtype(value.dtype, mx.floating)
+        else value
+        for name, value in weights.items()
+    }
+    model.load_weights(list(weights.items()), strict=True)
     mx.eval(model.parameters())
     model.eval()
     return LoadedEncoderBackend(
