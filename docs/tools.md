@@ -57,10 +57,6 @@ dflash --model ...` instead, retaining the other draft options. The draft-forwar
 and paged-cache diagnostics remain separate because they test different contracts.
 Measure speed separately with the [DSpark serving benchmark](https://github.com/vllm-project/vllm-metal/blob/main/tools/benchmark/dspark_serving_benchmark.py).
 
-## Laya decision parity
-
-For FP32 Laya encoder pooling, use [the Laya reference comparison](laya.md#validate-against-original-laya). It compares probabilities and logits rather than generated tokens; `EXACT` / `TOP_K_MATCH` token counts do not apply.
-
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.

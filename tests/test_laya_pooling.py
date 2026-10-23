@@ -12,11 +12,11 @@ from transformers import ModernBertConfig, ModernBertModel
 from vllm.pooling_params import PoolingParams
 
 from tests.test_v1_pooling import _new_req, _scheduler_output
-from vllm_metal.laya_registration import register
 from vllm_metal.v1.pooling.backends.encoder.models.laya import (
     LayaPoolingBackend,
     _create_model,
     clamp_temperature,
+    register,
     temperature_for,
 )
 from vllm_metal.v1.pooling.contract import EncoderPoolingRequest
@@ -87,7 +87,7 @@ def models():
             model="laya-test",
         )
     )
-    return model, reference, LayaPoolingBackend(view, model), ac
+    return model, reference, LayaPoolingBackend(view, model, ac), ac
 
 
 def pool_request(backend, request):
@@ -260,29 +260,40 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
     )
     model.load_weights(list(expected.items()), strict=True)
     calls = []
-    tokenizer = object()
 
-    def load_tokenizer(name, **kwargs):
-        calls.append((name, kwargs))
+    class Tokenizer:
+        mask_token_id = 7
+
+        def __call__(self, text, **kwargs):
+            return {
+                "input_ids": [{"choice": 10, "score": 11, "noul": 12}[text.split()[0]]]
+            }
+
+    tokenizer = Tokenizer()
+
+    def load_tokenizer(config):
+        calls.append(config)
         return tokenizer
 
-    monkeypatch.setattr(laya.AutoTokenizer, "from_pretrained", load_tokenizer)
+    monkeypatch.setattr(laya, "cached_tokenizer_from_config", load_tokenizer)
     config = checkpoint_config(reference, ac, tmp_path)
+    config.hf_config.laya_config = {
+        key: value
+        for key, value in ac.items()
+        if key not in ("mask_token_id", "qtype_token_ids")
+    }
     assert supports_encoder_pooling_backend(config)
     loaded = load_encoder_pooling_backend(config)
     assert loaded.tokenizer is tokenizer
-    assert calls == [
-        (
-            "laya-tokenizer",
-            {"revision": "pinned-tokenizer-revision", "trust_remote_code": False},
-        )
-    ]
+    assert calls == [config]
+    assert loaded.model_args["laya_config"]["qtype_token_ids"] == [10, 11, 12]
+    assert "qtype_token_ids" not in config.hf_config.laya_config
     request = EncoderPoolingRequest(
         "loaded",
         (2, 10, 7, 21, 7, 22),
         PoolingParams(task="token_classify", use_activation=False),
     )
-    expected_backend = LayaPoolingBackend(PoolingConfigView(config), model)
+    expected_backend = LayaPoolingBackend(PoolingConfigView(config), model, ac)
     np.testing.assert_allclose(
         pool_request(loaded.pooling_backend, request).numpy(),
         pool_request(expected_backend, request).numpy(),
@@ -297,6 +308,34 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("mask_token,types", [(None, [10, 11, 12]), (7, [10, 10, 12])])
+def test_invalid_tokenizer_is_rejected_before_weights(
+    tmp_path, monkeypatch, mask_token, types
+):
+    from vllm_metal.v1.pooling.backends.encoder.models import laya
+
+    _, reference, _, ac = models()
+
+    class Tokenizer:
+        mask_token_id = mask_token
+
+        def __call__(self, text, **kwargs):
+            return {
+                "input_ids": [types[("choice", "score", "noul").index(text.split()[0])]]
+            }
+
+    monkeypatch.setattr(
+        laya, "cached_tokenizer_from_config", lambda config: Tokenizer()
+    )
+
+    def unexpected_weights(*args):
+        pytest.fail("Invalid tokenizer must be rejected before loading weights")
+
+    monkeypatch.setattr(laya, "encoder_model_path", unexpected_weights)
+    with pytest.raises(ValueError, match="MASK token and three distinct"):
+        laya.load_laya_backend(checkpoint_config(reference, ac, tmp_path))
+
+
 @pytest.mark.parametrize(
     "overrides,config_field,value,error,message",
     [
@@ -304,7 +343,6 @@ def test_checkpoint_loads_through_factory(tmp_path, monkeypatch):
         ({"dtype": torch.bfloat16}, None, None, NotImplementedError, "float32"),
         ({"quantization": "awq"}, None, None, NotImplementedError, "quantization"),
         ({}, "quantization_config", {"bits": 4}, NotImplementedError, "quantization"),
-        ({}, "laya_config", {"qtype_token_ids": [10, 10, 12]}, ValueError, "distinct"),
         ({}, "hidden_activation", "relu", NotImplementedError, "GELU"),
         ({}, "model_type", "bert", NotImplementedError, "ModernBERT"),
         (
@@ -331,7 +369,7 @@ def test_loader_rejects_unsupported_before_io(
         pytest.fail("Rejected model must not download or load weights/tokenizer")
 
     monkeypatch.setattr(laya, "encoder_model_path", unexpected_io)
-    monkeypatch.setattr(laya.AutoTokenizer, "from_pretrained", unexpected_io)
+    monkeypatch.setattr(laya, "cached_tokenizer_from_config", unexpected_io)
     with pytest.raises(error, match=message):
         laya.load_laya_backend(config)
 
@@ -365,5 +403,7 @@ def test_registry_preserves_existing_architecture(monkeypatch, preexisting):
     register()
     register()
     assert entries["LayaForDecision"] == (
-        sentinel if preexisting else "vllm_metal.laya_registration:LayaForDecision"
+        sentinel
+        if preexisting
+        else "vllm_metal.v1.pooling.backends.encoder.models.laya:LayaForDecision"
     )

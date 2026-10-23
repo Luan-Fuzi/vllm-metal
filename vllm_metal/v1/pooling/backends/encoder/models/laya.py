@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adapt upstream MLX Laya decisions to encoder token pooling."""
+"""Native Laya loading, registration, and upstream MLX encoder pooling."""
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -11,9 +13,14 @@ import mlx.nn as nn
 import torch
 from mlx_vlm.models.laya import Model as LayaModel
 from mlx_vlm.models.laya import ModelConfig as LayaModelConfig
-from transformers import AutoTokenizer
+from transformers import ModernBertConfig, PreTrainedConfig
+from transformers.utils.hub import cached_file
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
+from vllm.tokenizers.hf import CachedHfTokenizer, HfTokenizer
+from vllm.tokenizers.protocol import TokenizerLike
+from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.transformers_utils.config_parser_base import ConfigParserBase
 
 from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
@@ -27,6 +34,102 @@ from vllm_metal.v1.pooling.contract import (
     LoadedEncoderBackend,
 )
 from vllm_metal.v1.pooling.validation import PoolingConfigView
+
+
+class LayaMetadataConfig(PreTrainedConfig):
+    """Recognize the Hub tracking config probed by vLLM's tokenizer registry."""
+
+    model_type = "laya"
+
+
+class LayaConfigParser(ConfigParserBase):
+    def parse(
+        self,
+        model: str | Path,
+        trust_remote_code: bool,
+        revision: str | None = None,
+        code_revision: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[dict, PreTrainedConfig]:
+        configs = []
+        for filename in ("encoder/config.json", "rl_agent_config.json"):
+            path = cached_file(
+                model,
+                filename,
+                revision=revision,
+                token=kwargs.get("token"),
+                cache_dir=kwargs.get("cache_dir"),
+            )
+            assert path is not None
+            configs.append(json.loads(Path(path).read_text()))
+        encoder, agent = configs
+        if encoder["model_type"] != "modernbert":
+            raise NotImplementedError("Metal Laya currently supports ModernBERT only.")
+        encoder.update(
+            architectures=["LayaForDecision"], dtype="float32", laya_config=agent
+        )
+        return encoder, ModernBertConfig.from_dict(encoder)
+
+
+class LayaTokenizer(TokenizerLike):
+    @classmethod
+    def from_pretrained(
+        cls, path_or_repo_id: str | Path, *args: Any, **kwargs: Any
+    ) -> HfTokenizer:
+        kwargs.setdefault("subfolder", "tokenizer")
+        # The tokenizer subdirectory has no model config for AutoTokenizer.
+        kwargs.setdefault("config", LayaMetadataConfig())
+        return CachedHfTokenizer.from_pretrained(path_or_repo_id, *args, **kwargs)
+
+
+class LayaForDecision(torch.nn.Module):
+    """Architecture metadata until vLLM ships its LayaForDecision registration."""
+
+    is_pooling_model = True
+    attn_type = "encoder_only"
+    default_tok_pooling_type = "ALL"
+
+    def __init__(self, *, vllm_config, prefix=""):
+        raise RuntimeError("Laya inference requires the Metal encoder pooling backend.")
+
+    def embed_input_ids(self, input_ids):
+        raise RuntimeError("Laya embeddings are owned by the Metal encoder loader.")
+
+    def forward(self, input_ids, positions):
+        raise RuntimeError("Laya inference requires the Metal encoder pooling backend.")
+
+
+def register() -> None:
+    from transformers import CONFIG_MAPPING, AutoConfig
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers.registry import TokenizerRegistry
+    from vllm.transformers_utils.config import (
+        get_config_parser,
+        register_config_parser,
+    )
+
+    if "laya" not in CONFIG_MAPPING:
+        AutoConfig.register("laya", LayaMetadataConfig)
+
+    try:
+        get_config_parser("laya")
+    except ValueError:
+        register_config_parser("laya")(LayaConfigParser)
+    if "laya" not in TokenizerRegistry.tokenizers:
+        TokenizerRegistry.register(
+            "laya",
+            "vllm_metal.v1.pooling.backends.encoder.models.laya",
+            "LayaTokenizer",
+        )
+    if "laya" not in RENDERER_REGISTRY.renderers:
+        RENDERER_REGISTRY.register("laya", "vllm.renderers.hf", "HfRenderer")
+
+    if "LayaForDecision" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            "LayaForDecision",
+            "vllm_metal.v1.pooling.backends.encoder.models.laya:LayaForDecision",
+        )
 
 
 def _create_model(config: dict[str, Any], agent_config: dict[str, Any]) -> LayaModel:
@@ -80,10 +183,12 @@ def temperature_for(config, qtype, options):
 
 
 class LayaPoolingBackend(MetalEncoderPoolingBackend):
-    def __init__(self, config: PoolingConfigView, model: LayaModel):
+    def __init__(
+        self, config: PoolingConfigView, model: LayaModel, agent_config: dict[str, Any]
+    ):
         super().__init__(config, self._encode)
         self.model = model
-        self.agent_config = config.hf_config.laya_config
+        self.agent_config = agent_config
 
     def _encode(self, input_ids: mx.array, attention_mask: mx.array) -> mx.array:
         return self.model.encoder(input_ids, attention_mask).last_hidden_state
@@ -172,13 +277,21 @@ def load_laya_backend(model_config: Any) -> LoadedEncoderBackend:
         raise NotImplementedError("Metal Laya does not support quantization yet.")
     if model_config.dtype != torch.float32:
         raise NotImplementedError("Metal Laya currently requires dtype=float32.")
-    agent_config = config["laya_config"]
-    if (
-        len(agent_config["qtype_token_ids"]) != 3
-        or len(set(agent_config["qtype_token_ids"])) != 3
-    ):
-        raise ValueError("Laya requires three distinct question-type token IDs.")
+    agent_config = dict(config["laya_config"])
     model = _create_model(config, agent_config)
+    tokenizer = cached_tokenizer_from_config(model_config)
+    if tokenizer is None:
+        raise ValueError("Laya requires tokenizer initialization.")
+    qtype_ids = [
+        tokenizer(f"{name} question: ", add_special_tokens=False)["input_ids"][0]
+        for name in ("choice", "score", "noul")
+    ]
+    if tokenizer.mask_token_id is None or len(set(qtype_ids)) != 3:
+        raise ValueError("Laya requires a MASK token and three distinct type tokens.")
+    agent_config.update(
+        mask_token_id=tokenizer.mask_token_id, qtype_token_ids=qtype_ids
+    )
+    config["laya_config"] = agent_config
     weights = model.sanitize(load_encoder_weights(encoder_model_path(model_config)))
     model.load_weights(
         [(name, value.astype(mx.float32)) for name, value in weights.items()],
@@ -186,14 +299,9 @@ def load_laya_backend(model_config: Any) -> LoadedEncoderBackend:
     )
     mx.eval(model.parameters())
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_config.tokenizer,
-        revision=model_config.tokenizer_revision,
-        trust_remote_code=model_config.trust_remote_code,
-    )
     return LoadedEncoderBackend(
         model,
         tokenizer,
         config,
-        LayaPoolingBackend(PoolingConfigView(model_config), model),
+        LayaPoolingBackend(PoolingConfigView(model_config), model, agent_config),
     )

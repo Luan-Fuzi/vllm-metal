@@ -14,10 +14,9 @@ per request through the same `pooler_output` contract.
 Canonical unquantized `BAAI/bge-m3` is supported on the encoder pooling path
 for dense `embed` output and sparse `token_classify` lexical weights.
 
-Converted ModernBERT-based Laya checkpoints support FP32 `token_classify`
-decision outputs. See [Laya typed decisions](laya.md) for checkpoint preparation,
-input rendering, and a runnable HTTP example. The real-checkpoint validation
-covers `convaiinnovations/laya-typed-decisions`.
+ModernBERT-based Laya checkpoints support FP32 `token_classify` decision
+outputs. See [Laya typed decisions](structured_decisions.md#laya) for native
+checkpoint loading and request examples.
 
 ## Scope
 
