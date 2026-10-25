@@ -292,13 +292,8 @@ def load_laya_backend(model_config: Any) -> LoadedEncoderBackend:
     )
     config["laya_config"] = agent_config
     weights = model.sanitize(load_encoder_weights(encoder_model_path(model_config)))
-    weights = {
-        name: value.astype(target_dtype)
-        if mx.issubdtype(value.dtype, mx.floating)
-        else value
-        for name, value in weights.items()
-    }
     model.load_weights(list(weights.items()), strict=True)
+    model.set_dtype(target_dtype)
     mx.eval(model.parameters())
     model.eval()
     return LoadedEncoderBackend(
